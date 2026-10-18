@@ -1,0 +1,7 @@
+{
+  "uuid": "ventilo@local",
+  "name": "Ventilo",
+  "description": "Fan modes (silent, automatic, maximum) of a Clevo laptop in Quick Settings.",
+  "shell-version": ["50"],
+  "url": ""
+}

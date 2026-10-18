@@ -1,0 +1,262 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+"""Fan control daemon for Clevo laptops (modes: silent, auto, max).
+
+Talks to the EC through /dev/tuxedo_io (driver tuxedo_io). The mode is read
+from ~/.config/ventilo/state.json; the status for the GNOME extension is written
+to $XDG_RUNTIME_DIR/ventilo/status.json.
+
+Safety: whatever the way this process ends (signal, error), the fans are given
+back to the firmware (auto). Only SIGKILL can leave them in the last fixed mode.
+"""
+import fcntl
+import glob
+import json
+import os
+import signal
+import struct
+import sys
+import time
+
+DEVICE = '/dev/tuxedo_io'
+MODES = ('silent', 'auto', 'max')
+
+# --- Translations (English is the source language) ---------------------------
+
+FRENCH = {
+    'Usage: ventilo [--auto | mode {modes}]': 'Usage : ventilo [--auto | mode {modes}]',
+    'ventilo: {error} (driver tuxedo_io loaded? permissions on {device}?)':
+        'ventilo : {error} (pilote tuxedo_io chargé ? droits sur {device} ?)',
+}
+
+
+def detect_language():
+    """'fr' when the system language is French, 'en' otherwise."""
+    for var in ('LANGUAGE', 'LC_ALL', 'LC_MESSAGES', 'LANG'):
+        value = os.environ.get(var, '')
+        if value:
+            return 'fr' if value.lower().startswith('fr') else 'en'
+    return 'en'
+
+
+TRANSLATIONS = FRENCH if detect_language() == 'fr' else {}
+
+
+def _(text):
+    return TRANSLATIONS.get(text, text)
+
+
+CONFIG_DIR = os.path.join(os.environ.get('XDG_CONFIG_HOME') or os.path.expanduser('~/.config'), 'ventilo')
+STATE_FILE = os.path.join(CONFIG_DIR, 'state.json')
+RUNTIME_DIR = os.path.join(os.environ.get('XDG_RUNTIME_DIR') or '/tmp', 'ventilo')
+STATUS_FILE = os.path.join(RUNTIME_DIR, 'status.json')
+
+# Silent curve: a fan goes up one level when the temperature reaches
+# UP_TEMPS[level] and goes back down HYSTERESIS degrees below it.
+# The kernel turns any duty under ~12 % into 0 (fan off) and raises 12-24 % to 25 %.
+UP_TEMPS = (60, 70, 78)
+DUTIES = (0, 30, 45, 60)  # percent, one more entry than UP_TEMPS
+HYSTERESIS = 5
+MIN_STEP_SECONDS = 6      # minimum time between two level changes (no pumping)
+# Above these, silent mode gives the fans back to the firmware until it cools down
+CEILING_CPU = 84
+CEILING_GPU = 80
+CEILING_RELEASE = 8
+
+LOOP_SECONDS = 2
+REWRITE_SECONDS = 30      # re-apply the mode (the EC may forget it after a suspend)
+
+# ioctl numbers of tuxedo_io_ioctl.h (Clevo interface, int32_t* argument)
+MAGIC_READ_CL, MAGIC_WRITE_CL = 0xED, 0xEE
+
+
+def _ioc(direction, magic, nr):
+    return (direction << 30) | (struct.calcsize('P') << 16) | (magic << 8) | nr
+
+
+R_CL_FANINFO1, R_CL_FANINFO2 = _ioc(2, MAGIC_READ_CL, 0x10), _ioc(2, MAGIC_READ_CL, 0x11)
+W_CL_FANSPEED, W_CL_FANAUTO = _ioc(1, MAGIC_WRITE_CL, 0x10), _ioc(1, MAGIC_WRITE_CL, 0x11)
+FANS_MASK = 0b111
+
+
+class Ec:
+    def __init__(self):
+        self.fd = os.open(DEVICE, os.O_RDWR)
+
+    def _read(self, request):
+        buf = bytearray(8)
+        fcntl.ioctl(self.fd, request, buf)
+        return struct.unpack_from('I', buf)[0]
+
+    def fan_info(self):
+        """[(duty 0-255, temperature °C)] for the CPU fan and the GPU fan."""
+        return [((v & 0xff), (v >> 16) & 0xff) for v in (self._read(R_CL_FANINFO1), self._read(R_CL_FANINFO2))]
+
+    def set_duties(self, percents):
+        value = 0
+        for i, percent in enumerate(percents):
+            value |= round(percent * 255 / 100) << (8 * i)
+        fcntl.ioctl(self.fd, W_CL_FANSPEED, struct.pack('Q', value))
+
+    def set_auto(self):
+        fcntl.ioctl(self.fd, W_CL_FANAUTO, struct.pack('Q', FANS_MASK))
+
+
+def find_cpu_sensor():
+    for hwmon in glob.glob('/sys/class/hwmon/hwmon*'):
+        try:
+            with open(f'{hwmon}/name') as f:
+                if f.read().strip() == 'coretemp':
+                    return f'{hwmon}/temp1_input'  # Package id 0
+        except OSError:
+            pass
+    return None
+
+
+def read_cpu_temp(path):
+    try:
+        with open(path) as f:
+            return int(f.read()) / 1000
+    except (OSError, ValueError, TypeError):
+        return None
+
+
+def next_level(temp, level):
+    while level < len(UP_TEMPS) and temp >= UP_TEMPS[level]:
+        level += 1
+    while level > 0 and temp < UP_TEMPS[level - 1] - HYSTERESIS:
+        level -= 1
+    return level
+
+
+def load_mode():
+    try:
+        with open(STATE_FILE) as f:
+            mode = json.load(f).get('mode')
+        return mode if mode in MODES else 'auto'
+    except (OSError, ValueError, AttributeError):
+        return 'auto'
+
+
+def save_mode(mode):
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    write_json(STATE_FILE, {'mode': mode})
+
+
+def write_json(path, data):
+    tmp = f'{path}.tmp'
+    with open(tmp, 'w') as f:
+        json.dump(data, f)
+    os.replace(tmp, path)
+
+
+class Daemon:
+    def __init__(self):
+        self.ec = Ec()
+        self.cpu_sensor = find_cpu_sensor()
+        self.mode = None
+        self.levels = [0, 0]
+        self.last_step = [0.0, 0.0]
+        self.applied = None   # what was last written to the EC
+        self.applied_at = 0.0
+        self.tripped = False
+        os.makedirs(RUNTIME_DIR, exist_ok=True)
+
+    def apply(self, target, now):
+        """target: 'auto' or [percent, percent]; written when it changes or periodically."""
+        if target == self.applied and now - self.applied_at < REWRITE_SECONDS:
+            return
+        if target == 'auto':
+            self.ec.set_auto()
+        else:
+            self.ec.set_duties(target)
+        self.applied, self.applied_at = target, now
+
+    def silent_target(self, cpu, gpu, now):
+        gpu_temp = gpu if gpu is not None else 0
+        ceiling_hit = cpu >= CEILING_CPU or gpu_temp >= CEILING_GPU
+        cool = cpu < CEILING_CPU - CEILING_RELEASE and gpu_temp < CEILING_GPU - CEILING_RELEASE
+        if ceiling_hit:
+            self.tripped = True
+        elif cool:
+            self.tripped = False
+        if self.tripped:
+            return 'auto'
+        # The two fans share heat pipes: each one also follows the other sensor
+        temps = (max(cpu, gpu_temp - 10), max(gpu_temp, cpu - 10))
+        for i, temp in enumerate(temps):
+            level = next_level(temp, self.levels[i])
+            # Never wait to speed up; only slow down at a calm pace
+            if level > self.levels[i] or now - self.last_step[i] >= MIN_STEP_SECONDS:
+                if level != self.levels[i]:
+                    self.last_step[i] = now
+                self.levels[i] = level
+        return [DUTIES[level] for level in self.levels]
+
+    def step(self):
+        now = time.monotonic()
+        mode = load_mode()
+        if mode != self.mode:
+            self.mode, self.applied = mode, None
+            self.levels, self.tripped = [0, 0], False
+
+        info = self.ec.fan_info()
+        cpu_ec, gpu = info[0][1], info[1][1]
+        cpu = read_cpu_temp(self.cpu_sensor) if self.cpu_sensor else None
+        if cpu is None:
+            cpu = cpu_ec
+        # A reading <= 1 means the GPU is powered off, not hot: ignore it
+        gpu = gpu if gpu > 1 else None
+
+        if mode == 'max':
+            target = [100, 100]
+        elif mode == 'silent':
+            target = self.silent_target(cpu, gpu, now)
+        else:
+            target = 'auto'
+        self.apply(target, now)
+
+        write_json(STATUS_FILE, {
+            'mode': mode,
+            'duty': [round(d * 100 / 255) for d, _ in info],
+            'cpu': round(cpu), 'gpu': gpu,  # null when the GPU is off
+            'released': self.tripped,
+            'time': time.time(),
+        })
+
+    def run(self):
+        try:
+            while True:
+                self.step()
+                time.sleep(LOOP_SECONDS)
+        finally:
+            try:
+                self.ec.set_auto()
+            except OSError:
+                pass
+
+
+def main():
+    args = sys.argv[1:]
+    if args == ['--auto']:
+        Ec().set_auto()
+        return
+    if len(args) == 2 and args[0] == 'mode' and args[1] in MODES:
+        save_mode(args[1])
+        return
+    if args:
+        sys.exit(_('Usage: ventilo [--auto | mode {modes}]').format(modes='|'.join(MODES)))
+
+    def stop(_signum, _frame):
+        raise SystemExit(0)
+    for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        signal.signal(sig, stop)
+    try:
+        Daemon().run()
+    except OSError as e:
+        sys.exit(_('ventilo: {error} (driver tuxedo_io loaded? permissions on {device}?)')
+                 .format(error=e, device=DEVICE))
+
+
+if __name__ == '__main__':
+    main()

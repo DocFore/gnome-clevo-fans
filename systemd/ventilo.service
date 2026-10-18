@@ -1,0 +1,12 @@
+[Unit]
+Description=Fan control (silent / auto / max) for Clevo laptops
+
+[Service]
+ExecStart=%h/.local/bin/ventilo
+# Belt and braces: the daemon already gives the fans back to the firmware when it stops
+ExecStopPost=-%h/.local/bin/ventilo --auto
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target

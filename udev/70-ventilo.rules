@@ -1,0 +1,5 @@
+# SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+# Numbered below 73 so that uaccess (73-seat-late.rules) sees the tag.
+# Let the logged-in user talk to the Clevo EC (fan control) through tuxedo_io.
+# Note: the device also exposes the webcam, touchpad and performance-profile switches.
+SUBSYSTEM=="tuxedo_io", KERNEL=="tuxedo_io", TAG+="uaccess"
