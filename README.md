@@ -34,7 +34,7 @@ of 1 °C or less means the GPU is off and is ignored by the curve.
 
 ## Requirements
 
-- The keyboard driver installed (`sudo ./install-system.sh` in `clavier/`),
+- The keyboard driver installed (see [rgb-keyboard-clevo](https://github.com/DocFore/rgb-keyboard-clevo)),
   `dkms` and kernel headers (`linux-headers-$(uname -r)`).
 - GNOME Shell 50 and `systemd --user`.
 - Secure Boot: same rules as the keyboard driver (the MOK key must be enrolled).
